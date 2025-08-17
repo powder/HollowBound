@@ -123,11 +123,13 @@
 
   // IndexedDB
   const dbp = new Promise((resolve, reject) => {
-    const req = indexedDB.open("rpg_widget_db", 7);
+    const req = indexedDB.open("rpg_widget_db", 8);
     req.onupgradeneeded = e => {
       const db = e.target.result;
       if (!db.objectStoreNames.contains("snapshots")) db.createObjectStore("snapshots", { keyPath: "id" });
       if (!db.objectStoreNames.contains("outbox")) db.createObjectStore("outbox", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("game_data")) db.createObjectStore("game_data", { keyPath: "key" });
+      if (!db.objectStoreNames.contains("current_quest")) db.createObjectStore("current_quest", { keyPath: "id" });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -208,10 +210,27 @@
   // Quest State
   let currentQuestState = null;
 
-  // New Quest API
+  // New Quest API & Caching
+  let lastSync = 0;
+  async function syncAllData() {
+    if (!server || Date.now() - lastSync < 300000) return; // Sync at most every 5 mins
+    pushLog("Syncing game data with server...");
+    const [locations, enemies, loot] = await Promise.all([
+      fetchJSON(`${server}/api/locations`),
+      fetchJSON(`${server}/enemies`),
+      fetchJSON(`${server}/loot`)
+    ]);
+    if (locations) await idbPut("game_data", { key: "locations", value: locations });
+    if (enemies) await idbPut("game_data", { key: "enemies", value: enemies });
+    if (loot) await idbPut("game_data", { key: "loot", value: loot });
+    lastSync = Date.now();
+  }
+
   async function getCurrentQuestState() {
     if (!server) return null;
-    return await fetchJSON(`${server}/quests/current?character_id=${encodeURIComponent(charId)}`);
+    const state = await fetchJSON(`${server}/quests/current?character_id=${encodeURIComponent(charId)}`);
+    if (state) await idbPut("current_quest", { id: charId, value: state });
+    return state;
   }
   async function postQuestAction(actionPayload) {
     if (!server) return null;
@@ -219,11 +238,24 @@
   }
   async function completeQuest() {
     if (!server) return null;
-    return await postJSON(`${server}/quests/complete`, { character_id: charId });
+    const result = await postJSON(`${server}/quests/complete`, { character_id: charId });
+    if (result) await idbDelete("current_quest", charId);
+    return result;
   }
 
   // Sim core
   const moreRecent = (a,b) => new Date(a.updated_at) > new Date(b.updated_at) ? a : b;
+  const jsWeightedRoll = rows => {
+    const total = rows.reduce((acc, r) => acc + (r.weight || 1), 0);
+    if (total <= 0) return null;
+    let pick = Math.random() * total;
+    for (const row of rows) {
+      pick -= (row.weight || 1);
+      if (pick <= 0) return row;
+    }
+    return rows[rows.length - 1];
+  };
+
   const decideAction = (c, questState) => {
     // Simple AI:
     // 1. If there are unvisited connections, travel to one.
@@ -341,45 +373,97 @@
     });
   }
 
+  async function resolveActionLocally(action, char, questState, gameData) {
+    // This is a simplified, client-side version of the server's endpoint logic
+    const { locations, enemies, loot } = gameData;
+    if (!questState || !locations || !enemies || !loot) return { log: "...but my memory is hazy.", rewards: [] };
+
+    const current_node = questState.nodes[questState.current_node_id];
+    let outcome = { log: "...", rewards: [] };
+
+    if (action.payload.action === "travel") {
+      const destination_id = action.payload.destination_id;
+      if (!current_node.connections.includes(destination_id)) return { log: "...but I can't get there from here.", rewards: [] };
+
+      questState.current_node_id = destination_id;
+      // Note: offline travel encounters are not implemented in this version
+      // as they are not tied to a specific node. A fuller implementation would cache them too.
+      outcome.log = `I have arrived at ${questState.nodes[destination_id].name}.`;
+
+    } else if (action.payload.action === "explore") {
+      const encounter = current_node.encounters[0]; // Assuming one per node
+      if (encounter && encounter.enemy_id) {
+        const enemy = enemies.find(e => e.id === encounter.enemy_id);
+        // Simplified loot roll - does not use server's weighted tables per enemy
+        const found_loot = Math.random() < 0.4 ? pick(loot) : null;
+        const xp_gain = 10 + Math.floor(Math.random() * 15);
+        const rewards = [{type: 'xp', value: xp_gain}];
+        if (found_loot) rewards.push({type: 'loot', value: found_loot});
+
+        outcome.log = `While exploring, I fought a ${enemy.name} and won, gaining ${xp_gain} XP.`;
+        outcome.rewards = rewards;
+      } else {
+        outcome.log = encounter ? encounter.description : "The area is peaceful.";
+      }
+    }
+    await idbPut("current_quest", { id: char.id, value: questState });
+    return outcome;
+  }
+
   // Action loop
   async function startActionLoop() {
     async function loop() {
       if (userEditing) {
-        setTimeout(loop, 2000); // Wait if user is editing
-        return;
+        setTimeout(loop, 2000); return;
       }
 
-      // 1. Get current quest state
-      currentQuestState = await getCurrentQuestState();
-      if (!currentQuestState) {
-        pushLog("Could not retrieve quest state from server.");
-        setTimeout(loop, 10000); // Wait longer before retrying
-        return;
+      // 1. Try to go online
+      let online = true;
+      const newState = await getCurrentQuestState();
+      if (newState) {
+        currentQuestState = newState;
+        syncAllData(); // Sync in background
+      } else {
+        online = false;
+        const cachedQuest = await idbGet("current_quest", charId);
+        if (cachedQuest) {
+          pushLog("Server unreachable. Continuing quest in offline mode.");
+          currentQuestState = cachedQuest.value;
+        } else {
+          pushLog("Server unreachable and no active quest. Taking a short rest.");
+          setTimeout(loop, 10000); return;
+        }
       }
-      render(currentChar); // Update location display
+      render(currentChar);
 
-      // 2. Handle completed quest
+      // 2. Handle quest completion
       if (currentQuestState.completed) {
         pushLog(`Finished quest: ${currentQuestState.quest_name}! Taking a long rest.`);
-        await completeQuest();
-        currentQuestState = null; // Clear state to force refetch
-        setTimeout(loop, 15000); // Wait a long time before next quest
-        return;
+        if (online) await completeQuest();
+        else await idbDelete("current_quest", charId);
+        currentQuestState = null;
+        setTimeout(loop, 15000); return;
       }
 
-      // 3. Decide on the next action
+      // 3. Decide and Execute Action
       const action = decideAction(currentChar, currentQuestState);
       pushLog(`I think I will ${action.logMessage}...`);
 
-      // 4. Post action to server and get outcome
-      const outcome = await postQuestAction(action.payload);
-      if (!outcome) {
-        pushLog("...but something went wrong.");
-        setTimeout(loop, 5000);
-        return;
+      let outcome;
+      if (online) {
+        outcome = await postQuestAction(action.payload);
+      } else {
+        const gameDataArr = await Promise.all([idbGet("game_data", "locations"), idbGet("game_data", "enemies"), idbGet("game_data", "loot")]);
+        const gameData = { locations: gameDataArr[0]?.value, enemies: gameDataArr[1]?.value, loot: gameDataArr[2]?.value };
+        outcome = await resolveActionLocally(action, currentChar, currentQuestState, gameData);
       }
 
-      // 5. Process outcome
+      if (!outcome) {
+        pushLog("...but something went wrong.");
+        setTimeout(loop, 5000); return;
+      }
+
+      // 4. Process Outcome
       pushLog(outcome.log);
       let leveled = false;
       const foundLoot = [];
@@ -394,19 +478,17 @@
           }
         }
       }
-
-      currentChar.updated_at = nowIso();
-      await idbPut("snapshots", currentChar);
-      await pushSnapshot(currentChar);
-      await recordEvent("quest_action", { action: action.payload, outcome: outcome });
-
       if (foundLoot.length > 0) pushLog(`Found ${foundLoot.join(', ')}.`);
       if (leveled) pushLog(`Level up to ${currentChar.level}!`);
-      render(currentChar);
 
-      // 6. Outbox flush and remote sync
-      flushOutbox();
-      if (server) {
+      // 5. Save state and sync
+      currentChar.updated_at = nowIso();
+      await idbPut("snapshots", currentChar);
+      render(currentChar);
+      if (online) {
+        await pushSnapshot(currentChar);
+        await recordEvent("quest_action", { action: action.payload, outcome: outcome });
+        flushOutbox();
         const remote = await fetchJSON(`${server}/character/${charId}`);
         if (remote) {
           const local = (await idbGet("snapshots", charId)) || currentChar;
@@ -416,8 +498,8 @@
         }
       }
 
-      // 7. Wait and repeat
-      setTimeout(loop, 4000 + Math.random() * 2000); // Wait 4-6 seconds
+      // 6. Wait and repeat
+      setTimeout(loop, 4000 + Math.random() * 2000);
     }
     loop();
   }

@@ -559,10 +559,31 @@ post "/quests/action" do
     QuestManager.update_quest_location(character_id, current_node_id, destination_id)
 
     encounter = quest.travel_encounters.sample
-    outcome = {
-      log: "Traveling to #{quest.get_node(destination_id).name}... #{encounter.description}",
-      rewards: encounter.rewards.map(&:to_h)
-    }
+    log_message = "Traveling to #{quest.get_node(destination_id).name}... "
+
+    if encounter && encounter.enemy_id
+      # Resolve combat encounter
+      loot_rows = ENEMY_LOOT.where(enemy_id: encounter.enemy_id).all
+      loot_item = nil
+      if loot_rows.any?
+        picked = weighted_roll(loot_rows)
+        loot_item = LOOT_ITEMS.where(id: picked[:loot_id]).first if picked
+      end
+      xp_gain = rand(18..32)
+      loot = loot_item ? [row_to_loot(loot_item)] : []
+      rewards = [{type: :xp, value: xp_gain}] + loot.map{|l| {type: :loot, value: l}}
+
+      outcome = {
+        log: log_message + "#{encounter.description} You won, gaining #{xp_gain} XP.",
+        rewards: rewards
+      }
+    else
+      # Peaceful encounter
+      outcome = {
+        log: log_message + (encounter ? encounter.description : "The journey is uneventful."),
+        rewards: []
+      }
+    end
 
   when "explore"
     current_node = quest.get_node(current_node_id)

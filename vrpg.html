@@ -60,7 +60,7 @@
     .quest { grid-area: quest; display: grid; gap: 4px; min-width: 0; }
     .quest-title { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .bar { width: 100%; height: 8px; border-radius: 999px; overflow: hidden; background: rgba(255,255,255,0.10); }
-    .bar > .fill { height: 100%; width: 0%; background: var(--accent); }
+    .bar > .fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.15s linear; }
 
     .log { grid-area: log; display: grid; gap: 2px; min-height: 64px; max-height: 160px; overflow: hidden; padding-top: 2px; }
     .log-line { font-size: 12px; opacity: 0.95; transition: opacity 1.6s ease; }
@@ -88,8 +88,8 @@
     </div>
 
     <div class="quest">
-      <div class="quest-title" id="questTitle">Location: Unknown</div>
-      <div class="bar" id="action-bar" style="display: none;"><div class="fill" id="action-fill"></div></div>
+      <div class="quest-title" id="questTitle">Quest: Placeholder title</div>
+      <div class="bar"><div class="fill" id="questFill"></div></div>
     </div>
 
     <div class="log" id="log"></div>
@@ -112,34 +112,45 @@
     xp: document.getElementById("xp"),
     nxt: document.getElementById("nxt"),
     log: document.getElementById("log"),
+    questFill: document.getElementById("questFill"),
     questTitle: document.getElementById("questTitle"),
-    actionBar: document.getElementById("action-bar"),
-    actionFill: document.getElementById("action-fill"),
     win: document.getElementById("charWindow")
   };
 
   // Bootstrap Data
   const bootstrapData = {
-    locations: [
-      { id: 1, name: "The Whispering Creek", description: "A quiet creek, but the trees seem to whisper secrets.", type: "forest" },
-      { id: 2, name: "Old Man's Hill", description: "A lonely hill dotted with ancient, weathered stones.", type: "hills" },
-      { id: 3, name: "Goblin Camp", description: "A crude, messy encampment of goblins.", type: "camp" },
-      { id: 4, name: "The Sunken Ruin", description: "The mossy stones of a forgotten building sink into the marsh.", type: "ruin" }
-    ],
-    enemies: [
-      { id: 1, name: "Goblin" },
-      { id: 2, name: "Giant Rat" }
-    ],
-    loot: [
-      { id: 1, key: "rusty_sword", name: "Rusty Sword", effects: { atk: 1 }, rarity: "common" },
-      { id: 2, key: "goblin_ear", name: "Goblin Ear", effects: {}, rarity: "common" },
-      { id: 3, key: "healing_draught", name: "Healing Draught", effects: { heal: 15 }, rarity: "uncommon" }
-    ],
-    titles: [
-      { id: 1, title: "The Goblin Menace" },
-      { id: 2, title: "A Rat in the Walls" }
-    ]
+    enemies: [ { id: 1, name: "Goblin" }, { id: 2, name: "Giant Rat" } ],
+    loot: [ { id: 1, key: "rusty_sword", name: "Rusty Sword", effects: { atk: 1 } } ],
+    titles: [ { id: 1, title: "A Menacing Threat" } ]
   };
+
+  // Game Data Cache
+  let gameData = { ...bootstrapData };
+
+  async function syncData() {
+    // 1. Try to load from cache first
+    const cached = await idbGet("game_data", "content");
+    if (cached) {
+      gameData = cached.value;
+      pushLog("Loaded cached game data.");
+    }
+
+    // 2. Then, try to sync with server in the background
+    if (server) {
+      const [enemies, loot, titles] = await Promise.all([
+        fetchJSON(`${server}/enemies`),
+        fetchJSON(`${server}/loot`),
+        fetchJSON(`${server}/quests/titles`)
+      ]);
+
+      if (enemies && loot && titles && enemies.length > 0) {
+        const newData = { enemies, loot, titles };
+        gameData = newData;
+        await idbPut("game_data", { key: "content", value: newData });
+        pushLog("Synced game data with server.");
+      }
+    }
+  }
 
   // Params
   const params = new URLSearchParams(location.search);
@@ -148,13 +159,12 @@
 
   // IndexedDB
   const dbp = new Promise((resolve, reject) => {
-    const req = indexedDB.open("rpg_widget_db", 9);
+    const req = indexedDB.open("rpg_widget_db", 8); // Bump version for schema change
     req.onupgradeneeded = e => {
       const db = e.target.result;
       if (!db.objectStoreNames.contains("snapshots")) db.createObjectStore("snapshots", { keyPath: "id" });
       if (!db.objectStoreNames.contains("outbox")) db.createObjectStore("outbox", { keyPath: "id" });
       if (!db.objectStoreNames.contains("game_data")) db.createObjectStore("game_data", { keyPath: "key" });
-      if (!db.objectStoreNames.contains("current_quest")) db.createObjectStore("current_quest", { keyPath: "id" });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -214,10 +224,6 @@
     el.stats.textContent = Object.entries(c.stats).map(([k,v]) => `${k.toUpperCase()}:${v}`).join("  ");
     el.xp.textContent = nfmt(c.xp);
     el.nxt.textContent = nfmt(c.next_level_xp);
-
-    if (currentQuestState) {
-      el.questTitle.textContent = `Location: ${currentQuestState.nodes[currentQuestState.current_node_id].name}`;
-    }
   }
 
   // Log with timed fade
@@ -232,162 +238,44 @@
     while (el.log.children.length > maxLines) el.log.lastElementChild?.remove();
   }
 
-  // Quest State
-  let currentQuestState = null;
+  // Quest visuals
+  const quest = { active:false, title:"Placeholder title", start:0, duration:6000 };
+  const setQuestTitle = t => { quest.title = t || "Placeholder title"; el.questTitle.textContent = `Quest: ${quest.title}`; };
+  const startQuest = ms => { quest.active = true; quest.start = performance.now(); quest.duration = ms; };
+  const raf = () => {
+    if (quest.active) {
+      const pct = clamp((performance.now() - quest.start) / quest.duration, 0, 1);
+      el.questFill.style.width = `${Math.floor(pct * 100)}%`;
+      if (pct >= 1) quest.active = false;
+    }
+    requestAnimationFrame(raf);
+  };
+  requestAnimationFrame(raf);
 
-  // New Quest API & Caching
-  let lastSync = 0;
-  async function syncData() {
-    if (Date.now() - lastSync < 300000 && server) return;
-    let synced = false;
+  async function getQuestTitle() {
+    if (!server) return "A Rumor of Riches";
+    const data = await fetchJSON(`${server}/quests/current_title?character_id=${encodeURIComponent(charId)}`);
+    return (data && data.title) || "A Rumor of Riches";
+  }
 
+  // Backend-driven quest outcome, with offline fallback
+  async function resolveQuestOutcome(char) {
     if (server) {
-      pushLog("Syncing game data with server...");
-      const [locations, enemies, loot, titles] = await Promise.all([
-        fetchJSON(`${server}/api/locations`),
-        fetchJSON(`${server}/enemies`),
-        fetchJSON(`${server}/loot`),
-        fetchJSON(`${server}/quests/titles`)
-      ]);
-      if (locations && enemies && loot && titles) {
-        const gameData = { locations, enemies, loot, titles };
-        await idbPut("game_data", { key: "content", value: gameData });
-        synced = true;
+      const resp = await postJSON(`${server}/quests/resolve`, { character: char });
+      if (resp && typeof resp.xp === "number") {
+        return { xp: resp.xp, loot: Array.isArray(resp.loot) ? resp.loot : [] };
       }
     }
-
-    if (!synced) {
-      const cached = await idbGet("game_data", "content");
-      if (!cached) {
-        pushLog("Using bootstrap game data to prime cache.");
-        await idbPut("game_data", { key: "content", value: bootstrapData });
-      }
-    }
-    lastSync = Date.now();
-  }
-
-  async function getCurrentQuestState() {
-    if (!server) return null;
-    const state = await fetchJSON(`${server}/quests/current?character_id=${encodeURIComponent(charId)}`);
-    // An empty object from the server means no quest is available (e.g. empty DB)
-    if (state && Object.keys(state).length > 0) {
-      await idbPut("current_quest", { id: charId, value: state });
-      return state;
-    }
-    if (state && Object.keys(state).length === 0) {
-      return {}; // Explicitly return empty object to signal no quest available
-    }
-    return null; // Server is down
-  }
-  async function postQuestAction(actionPayload) {
-    if (!server) return null;
-    return await postJSON(`${server}/quests/action`, { character_id: charId, ...actionPayload });
-  }
-  async function completeQuest() {
-    if (!server) return null;
-    const result = await postJSON(`${server}/quests/complete`, { character_id: charId });
-    if (result) await idbDelete("current_quest", charId);
-    return result;
+    const xp = 20 + Math.floor(Math.random() * 25);
+    const loot = Math.random() < 0.5 ? [randomLoot()] : [];
+    return { xp, loot };
   }
 
   // Sim core
   const moreRecent = (a,b) => new Date(a.updated_at) > new Date(b.updated_at) ? a : b;
-  const jsWeightedRoll = rows => {
-    const total = rows.reduce((acc, r) => acc + (r.weight || 1), 0);
-    if (total <= 0) return null;
-    let pick = Math.random() * total;
-    for (const row of rows) {
-      pick -= (row.weight || 1);
-      if (pick <= 0) return row;
-    }
-    return rows[rows.length - 1];
-  };
-
-  function generateQuestLocally(gameData) {
-    const { locations, enemies, titles } = gameData;
-    if (!locations || locations.length === 0) return null;
-
-    const questTitle = titles && titles.length > 0 ? pick(titles).title : "A Grand Adventure";
-    const questId = `local_quest_${Date.now()}`;
-
-    const numNodes = Math.min(locations.length, 15 + Math.floor(Math.random() * 11)); // 15-25 nodes
-    const extraConnections = Math.floor(numNodes / 2);
-
-    const nodeTemplates = [...locations].sort(() => 0.5 - Math.random()).slice(0, numNodes);
-    const nodes = nodeTemplates.map((loc, i) => ({
-      id: `node_${i}`,
-      name: loc.name,
-      description: loc.description,
-      type: loc.type,
-      connections: [],
-      encounters: []
-    }));
-
-    const mainPath = [...nodes].sort(() => 0.5 - Math.random());
-    const startNodeId = mainPath[0].id;
-    const endNodeId = mainPath[mainPath.length - 1].id;
-
-    for (let i = 0; i < mainPath.length - 1; i++) {
-      const a = mainPath[i];
-      const b = mainPath[i+1];
-      a.connections.push(b.id);
-      b.connections.push(a.id);
-    }
-
-    for (let i = 0; i < extraConnections; i++) {
-      const a = pick(nodes);
-      const b = pick(nodes);
-      if (a.id === b.id || a.connections.includes(b.id)) continue;
-      a.connections.push(b.id);
-      b.connections.push(a.id);
-    }
-
-    nodes.forEach(node => {
-      if (Math.random() < 0.7 && enemies && enemies.length > 0) {
-        const enemy = pick(enemies);
-        node.encounters.push({
-          id: `enc_${Math.random().toString(36).slice(2, 8)}`,
-          description: `You are confronted by a ${enemy.name}!`,
-          enemy_id: enemy.id
-        });
-      } else {
-        node.encounters.push({
-          id: `enc_${Math.random().toString(36).slice(2, 8)}`,
-          description: "The area is quiet. You find a moment to rest.",
-          enemy_id: null
-        });
-      }
-    });
-
-    const nodesAsObject = nodes.reduce((acc, n) => { acc[n.id] = n; return acc; }, {});
-
-    return {
-      id: questId,
-      name: questTitle,
-      start_node_id: startNodeId,
-      end_node_id: endNodeId,
-      nodes: nodesAsObject,
-      travel_encounters: [] // Offline travel encounters not supported in this version
-    };
-  }
-
-  const decideAction = (c, questState) => {
-    const unvisited = questState.nodes[questState.current_node_id].connections;
-    if (unvisited.length > 0) {
-      const destinationId = pick(unvisited);
-      const destinationName = questState.nodes[destinationId].name;
-      return {
-        logMessage: `travel to ${destinationName}`,
-        payload: { action: "travel", destination_id: destinationId },
-        duration: 4000 + Math.random() * 4000 // 4-8s
-      };
-    } else {
-      return {
-        logMessage: `explore ${questState.nodes[questState.current_node_id].name}`,
-        payload: { action: "explore" },
-        duration: 3000 + Math.random() * 3000 // 3-6s
-      };
-    }
+  const decideAction = c => {
+    const s = { quest: c.wants.xp*0.7 + c.wants.loot*0.7 + (1-c.needs.fatigue)*0.3, rest: c.needs.fatigue*0.8 + c.wants.rest*0.2 };
+    return s.quest >= s.rest ? "quest" : "rest";
   };
   const gainXP = (c, amount) => {
     c.xp += amount; let leveled = false;
@@ -488,171 +376,83 @@
     });
   }
 
-  async function resolveActionLocally(action, char, questState, gameData) {
-    const { enemies, loot } = gameData;
-    if (!questState || !enemies || !loot) return { log: "...but my memory is hazy.", rewards: [] };
-
-    const current_node = questState.nodes[questState.current_node_id];
-    let outcome = { log: "...", rewards: [] };
-
-    if (action.payload.action === "travel") {
-      const destination_id = action.payload.destination_id;
-      if (!current_node.connections.includes(destination_id)) return { log: "...but I can't get there from here.", rewards: [] };
-
-      questState.current_node_id = destination_id;
-      outcome.log = `I have arrived at ${questState.nodes[destination_id].name}.`;
-
-    } else if (action.payload.action === "explore") {
-      const encounter = current_node.encounters[0];
-      if (encounter && encounter.enemy_id) {
-        const enemy = enemies.find(e => e.id === encounter.enemy_id);
-        const found_loot = Math.random() < 0.4 ? pick(loot) : null;
-        const xp_gain = 10 + Math.floor(Math.random() * 15);
-        const rewards = [{type: 'xp', value: xp_gain}];
-        if (found_loot) rewards.push({type: 'loot', value: found_loot});
-
-        outcome.log = `While exploring, I fought a ${enemy.name} and won, gaining ${xp_gain} XP.`;
-        outcome.rewards = rewards;
-      } else {
-        outcome.log = encounter ? encounter.description : "The area is peaceful.";
-      }
-    }
-    await idbPut("current_quest", { id: char.id, value: questState });
-    return outcome;
-  }
-
-  // Action Timer
-  function runActionTimer(duration) {
-    return new Promise(resolve => {
-      el.actionBar.style.display = 'block';
-      let start = performance.now();
-      const raf = (now) => {
-        const pct = clamp((now - start) / duration, 0, 1);
-        el.actionFill.style.width = `${Math.floor(pct * 100)}%`;
-        if (pct >= 1) {
-          el.actionBar.style.display = 'none';
-          resolve();
-        } else {
-          requestAnimationFrame(raf);
-        }
-      };
-      requestAnimationFrame(raf);
-    });
-  }
-
   // Action loop
+  let runningAction = null;
+
   async function startActionLoop() {
     async function loop() {
-      if (userEditing) {
-        setTimeout(loop, 2000); return;
-      }
+      // Complete quest
+      if (runningAction === "quest" && !quest.active) {
+        const outcome = await resolveQuestOutcome(currentChar, { enemy_id: quest.enemy_id });
+        const leveled = gainXP(currentChar, outcome.xp);
+        currentChar.needs.fatigue = clamp(currentChar.needs.fatigue + 0.2, 0, 1);
+        if (Array.isArray(outcome.loot)) for (const it of outcome.loot) currentChar.inventory.push({ ...it });
+        currentChar.updated_at = nowIso();
 
-      // 1. Try to go online
-      let online = true;
-      let serverState = await getCurrentQuestState();
-      if (serverState === null) {
-        online = false;
-      }
-
-      if (online) {
-        syncData(); // Sync in background
-        if (Object.keys(serverState).length > 0) {
-          currentQuestState = serverState;
-        } else {
-          // No quest on server, clear local one if it exists
-          currentQuestState = null;
-          await idbDelete("current_quest", charId);
-        }
-      }
-
-      if (!currentQuestState) {
-        const cachedQuest = await idbGet("current_quest", charId);
-        if (cachedQuest) {
-          pushLog("Continuing quest in offline mode.");
-          currentQuestState = cachedQuest.value;
-        } else {
-          pushLog("Attempting to generate a new quest locally.");
-          const gameDataResult = await idbGet("game_data", "content");
-          const gameData = gameDataResult ? gameDataResult.value : bootstrapData;
-          const newQuest = generateQuestLocally(gameData);
-          if (newQuest) {
-            pushLog("Generated a new local quest: " + newQuest.name);
-            currentQuestState = newQuest;
-            await idbPut("current_quest", { id: charId, value: newQuest });
-          } else {
-            pushLog("Not enough local data to generate a quest. Resting instead.");
-            setTimeout(loop, 10000); return;
-          }
-        }
-      }
-      render(currentChar);
-
-      // 2. Handle quest completion
-      if (currentQuestState.current_node_id === currentQuestState.end_node_id) {
-        pushLog(`Finished quest: ${currentQuestState.name}! Taking a long rest.`);
-        if (online) await completeQuest();
-        else await idbDelete("current_quest", charId);
-        currentQuestState = null;
-        setTimeout(loop, 15000); return;
-      }
-
-      // 3. Decide and Execute Action
-      const action = decideAction(currentChar, currentQuestState);
-      pushLog(`I think I will ${action.logMessage}...`);
-
-      await runActionTimer(action.duration);
-
-      let outcome;
-      if (online) {
-        outcome = await postQuestAction(action.payload);
-      } else {
-        const gameDataResult = await idbGet("game_data", "content");
-        const gameData = gameDataResult ? gameDataResult.value : bootstrapData;
-        outcome = await resolveActionLocally(action, currentChar, currentQuestState, gameData);
-      }
-
-      if (!outcome) {
-        pushLog("...but something went wrong.");
-        setTimeout(loop, 5000); return;
-      }
-
-      // 4. Process Outcome
-      pushLog(outcome.log);
-      let leveled = false;
-      const foundLoot = [];
-      if (Array.isArray(outcome.rewards)) {
-        for (const reward of outcome.rewards) {
-          if (reward.type === 'xp' && reward.value > 0) {
-            if (gainXP(currentChar, reward.value)) leveled = true;
-          }
-          if (reward.type === 'loot') {
-            currentChar.inventory.push(reward.value);
-            foundLoot.push(reward.value.name);
-          }
-        }
-      }
-      if (foundLoot.length > 0) pushLog(`Found ${foundLoot.join(', ')}.`);
-      if (leveled) pushLog(`Level up to ${currentChar.level}!`);
-
-      // 5. Save state and sync
-      currentChar.updated_at = nowIso();
-      await idbPut("snapshots", currentChar);
-      render(currentChar);
-      if (online) {
+        await idbPut("snapshots", currentChar);
         await pushSnapshot(currentChar);
-        await recordEvent("quest_action", { action: action.payload, outcome: outcome });
-        flushOutbox();
+        await recordEvent("quest_result", outcome);
+
+        pushLog(`Quest complete. +${nfmt(outcome.xp)} XP.`);
+        if (outcome.loot && outcome.loot.length) pushLog(`Found ${outcome.loot.map(l=>l.name).join(", ")}.`);
+        if (leveled) pushLog(`Level up to ${currentChar.level}!`);
+        render(currentChar);
+        runningAction = null;
+      }
+
+      // Complete rest
+      if (runningAction === "rest" && !quest.active) {
+        currentChar.needs.fatigue = clamp(currentChar.needs.fatigue - 0.35, 0, 1);
+        currentChar.updated_at = nowIso();
+
+        await idbPut("snapshots", currentChar);
+        await pushSnapshot(currentChar);
+        await recordEvent("rest", {});
+
+        pushLog("Resting complete.");
+        render(currentChar);
+        runningAction = null;
+      }
+
+      // Start next action only if not editing
+      if (!runningAction && !userEditing) {
+        const action = decideAction(currentChar);
+        if (action === "quest") {
+          const targetEnemy = gameData.enemies.length > 0 ? pick(gameData.enemies) : null;
+          const baseTitleData = gameData.titles.length > 0 ? pick(gameData.titles) : { title: "A Quest" };
+
+          quest.enemy_id = targetEnemy ? targetEnemy.id : null;
+          const questTitle = targetEnemy ? `${baseTitleData.title}: Hunt the ${targetEnemy.name}` : baseTitleData.title;
+
+          setQuestTitle(questTitle);
+          startQuest(6000 + Math.random() * 4000); // 6-10s quests
+          runningAction = "quest";
+          pushLog(`Setting out to: ${questTitle}...`);
+        } else {
+          setQuestTitle("Taking a breather");
+          startQuest(4000);
+          runningAction = "rest";
+          pushLog("Taking a rest...");
+        }
+      }
+
+      // Outbox flush
+      flushOutbox();
+
+      // Remote pull with edit-safe merge
+      if (server) {
         const remote = await fetchJSON(`${server}/character/${charId}`);
         if (remote) {
           const local = (await idbGet("snapshots", charId)) || currentChar;
-          currentChar = moreRecent(local, remote) === remote ? mergeRemotePreservingEdits(local, remote) : local;
+          let chosen = local;
+          if (moreRecent(local, remote) === remote) chosen = mergeRemotePreservingEdits(local, remote);
+          currentChar = chosen;
           await idbPut("snapshots", currentChar);
           render(currentChar);
         }
       }
 
-      // 6. Wait and repeat
-      setTimeout(loop, 1000 + Math.random() * 1000); // 1-2s between actions
+      setTimeout(loop, 500);
     }
     loop();
   }
@@ -660,7 +460,7 @@
   // Start
   (async function main(){
     el.win.textContent = ""; // placeholder window
-    await syncData(); // Prime the cache on startup
+    await syncData();
     currentChar = await loadSnapshot();
     render(currentChar);
     pushLog("Widget ready.");

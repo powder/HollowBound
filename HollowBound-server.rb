@@ -1,12 +1,9 @@
-# backend_sqlite.rb
+# backend_sqlite_crud.rb
 require "sinatra"
 require "json"
 require "sequel"
 require "securerandom"
 require "time"
-
-require_relative "lib/point_crawl"
-require_relative "lib/quest_generator"
 
 set :bind, "0.0.0.0"
 set :port, 4567
@@ -14,11 +11,11 @@ set :port, 4567
 DB_PATH = ENV.fetch("RPG_DB", "rpg.db")
 DB = Sequel.sqlite(DB_PATH)
 
-# --- Schema bootstrap ---
+# ---------------- Schema ----------------
 DB.create_table?(:characters) do
   String  :id, primary_key: true
-  Text    :json, null: false       # full snapshot blob
-  String  :updated_at, null: false # ISO8601 string for quick compare
+  Text    :json, null: false
+  String  :updated_at, null: false
   index   :updated_at
 end
 
@@ -29,14 +26,6 @@ DB.create_table?(:events) do
   String  :updated_at, null: false
   index   :character_id
   index   :updated_at
-end
-
-DB.create_table?(:character_quests) do
-  String :character_id, primary_key: true
-  Text   :quest_json, null: false
-  String :current_node_id, null: false
-  Text   :completed_nodes_json, null: false # JSON array of strings
-  String :updated_at, null: false
 end
 
 # Quest titles: simple strings with timestamps
@@ -77,84 +66,14 @@ DB.create_table?(:enemy_loot) do
   index [:enemy_id, :loot_id], unique: true
 end
 
-DB.create_table?(:location_templates) do
-  primary_key :id
-  String :name, null: false
-  String :description, null: false
-  String :type, null: false, default: "generic" # :town, :dungeon, :ruin etc.
-  String :updated_at, null: false
-end
+CHARACTERS  = DB[:characters]
+EVENTS      = DB[:events]
+QUESTS      = DB[:quest_titles]
+LOOT        = DB[:loot_items]
+ENEMIES     = DB[:enemies]
+ENEMY_LOOT  = DB[:enemy_loot]
 
-CHARACTERS      = DB[:characters]
-EVENTS          = DB[:events]
-ACTIVE_QUESTS   = DB[:character_quests]
-QUEST_TITLES    = DB[:quest_titles]
-LOOT_ITEMS      = DB[:loot_items]
-ENEMIES         = DB[:enemies]
-ENEMY_LOOT      = DB[:enemy_loot]
-LOCATION_TEMPLATES = DB[:location_templates]
-
-# ---- Quest Management ----
-module QuestManager
-  def self.get_current_quest(character_id)
-    row = ACTIVE_QUESTS.where(character_id: character_id).first
-    return nil unless row
-
-    quest = PointCrawl::Quest.from_h(JSON.parse(row[:quest_json]))
-    {
-      quest: quest,
-      current_node_id: row[:current_node_id],
-      completed_nodes: JSON.parse(row[:completed_nodes_json])
-    }
-  end
-
-  def self.generate_new_quest(character_id)
-    # Fetch data for the generator
-    locations = LOCATION_TEMPLATES.all
-    enemies = ENEMIES.all
-    titles = QUEST_TITLES.all
-
-    # Generate the quest object
-    quest = PointCrawl::QuestGenerator.generate(
-      quest_id: "quest_#{SecureRandom.hex(4)}",
-      locations: locations,
-      enemies: enemies,
-      titles: titles
-    )
-    return nil unless quest # Return nil if quest generation failed (e.g. no locations)
-
-    start_node_id = quest.start_node_id
-
-    ACTIVE_QUESTS.insert(
-      character_id: character_id,
-      quest_json: quest.to_h.to_json,
-      current_node_id: start_node_id,
-      completed_nodes_json: [].to_json,
-      updated_at: Time.now.utc.iso8601
-    )
-
-    {
-      quest: quest,
-      current_node_id: start_node_id,
-      completed_nodes: []
-    }
-  end
-
-  def self.update_quest_location(character_id, old_node_id, new_node_id)
-    row = ACTIVE_QUESTS.where(character_id: character_id).first
-    return unless row # Or handle error
-
-    completed = JSON.parse(row[:completed_nodes_json])
-    completed << old_node_id unless completed.include?(old_node_id)
-
-    ACTIVE_QUESTS.where(character_id: character_id).update(
-      current_node_id: new_node_id,
-      completed_nodes_json: completed.to_json,
-      updated_at: Time.now.utc.iso8601
-    )
-  end
-end
-
+# ---------------- Helpers ----------------
 helpers do
   def json_body
     request.body.rewind
@@ -166,10 +85,6 @@ helpers do
 
   def now_iso
     Time.now.utc.iso8601
-  end
-
-  def iso(t)
-    t.is_a?(String) ? t : t.to_s
   end
 
   def parse_iso(s)
@@ -219,16 +134,14 @@ options "*" do
   200
 end
 
-# ---- Characters ----
+# ---------------- Characters ----------------
 
-# Fetch a character snapshot
 get "/character/:id" do |id|
   row = CHARACTERS.where(id: id).first
   halt 404, { error: "not found" }.to_json unless row
   row[:json]
 end
 
-# Upsert a character snapshot with last write wins by updated_at
 put "/character/:id" do |id|
   body = json_body
   incoming_updated = parse_iso(body["updated_at"] || now_iso)
@@ -248,9 +161,6 @@ put "/character/:id" do |id|
   { ok: true }.to_json
 end
 
-# ---- Events ----
-
-# Accept a batch of events
 post "/events/batch" do
   data = json_body
   events = Array(data["events"])
@@ -268,7 +178,6 @@ post "/events/batch" do
                       updated_at: ev_updated)
         stored += 1
       else
-        # If duplicate id arrives, keep the one with newer updated_at
         if parse_iso(ev_updated) > parse_iso(raw[:updated_at])
           EVENTS.where(id: ev_id).update(json: ev.to_json, updated_at: ev_updated)
           stored += 1
@@ -284,7 +193,7 @@ end
 
 # List all quest titles
 get "/quests/titles" do
-  QUEST_TITLES.order(:id).all.map { |r| { id: r[:id], title: r[:title], updated_at: r[:updated_at] } }.to_json
+  QUESTS.order(:id).all.map { |r| { id: r[:id], title: r[:title], updated_at: r[:updated_at] } }.to_json
 end
 
 # Create quest title
@@ -292,13 +201,13 @@ post "/quests/titles" do
   b = json_body
   title = (b["title"] || "").strip
   halt 400, { error: "title required" }.to_json if title.empty?
-  id = QUEST_TITLES.insert(title: title, updated_at: now_iso)
+  id = QUESTS.insert(title: title, updated_at: now_iso)
   { id: id, title: title }.to_json
 end
 
 # Read quest title
 get "/quests/titles/:id" do |id|
-  r = QUEST_TITLES.where(id: id.to_i).first
+  r = QUESTS.where(id: id.to_i).first
   halt 404, { error: "not found" }.to_json unless r
   { id: r[:id], title: r[:title], updated_at: r[:updated_at] }.to_json
 end
@@ -308,23 +217,31 @@ put "/quests/titles/:id" do |id|
   b = json_body
   title = (b["title"] || "").strip
   halt 400, { error: "title required" }.to_json if title.empty?
-  cnt = QUEST_TITLES.where(id: id.to_i).update(title: title, updated_at: now_iso)
+  cnt = QUESTS.where(id: id.to_i).update(title: title, updated_at: now_iso)
   halt 404, { error: "not found" }.to_json if cnt == 0
   { ok: true }.to_json
 end
 
 # Delete quest title
 delete "/quests/titles/:id" do |id|
-  cnt = QUEST_TITLES.where(id: id.to_i).delete
+  cnt = QUESTS.where(id: id.to_i).delete
   halt 404, { error: "not found" }.to_json if cnt == 0
   { ok: true }.to_json
+end
+
+# Existing title picker used by the overlay
+get "/quests/current_title" do
+  char_id = params["character_id"]
+  row = QUESTS.order(Sequel.lit("RANDOM()")).first
+  fallback = ["Goblin Troubles", "The Lost Amulet", "A Rumor of Riches", "Bandits on the Road", "Crypt of Forgotten Kings"].sample
+  { title: row ? row[:title] : fallback, character_id: char_id }.to_json
 end
 
 # ---------------- Loot CRUD ----------------
 
 # List loot
 get "/loot" do
-  LOOT_ITEMS.order(:id).all.map { |r| row_to_loot(r) }.to_json
+  LOOT.order(:id).all.map { |r| row_to_loot(r) }.to_json
 end
 
 # Create loot
@@ -335,13 +252,13 @@ post "/loot" do
   effects = b["effects"] || {}
   rarity = b["rarity"]
   halt 400, { error: "key and name required" }.to_json if key.empty? || name.empty?
-  id = LOOT_ITEMS.insert(key: key, name: name, effects_json: effects_json_from(effects), rarity: rarity, updated_at: now_iso)
-  row_to_loot(LOOT_ITEMS.where(id: id).first).to_json
+  id = LOOT.insert(key: key, name: name, effects_json: effects_json_from(effects), rarity: rarity, updated_at: now_iso)
+  row_to_loot(LOOT.where(id: id).first).to_json
 end
 
 # Read loot
 get "/loot/:id" do |id|
-  r = LOOT_ITEMS.where(id: id.to_i).first
+  r = LOOT.where(id: id.to_i).first
   halt 404, { error: "not found" }.to_json unless r
   row_to_loot(r).to_json
 end
@@ -355,14 +272,14 @@ put "/loot/:id" do |id|
   updates[:effects_json] = effects_json_from(b["effects"]) if b.key?("effects")
   updates[:rarity] = b["rarity"] if b.key?("rarity")
   updates[:updated_at] = now_iso
-  cnt = LOOT_ITEMS.where(id: id.to_i).update(updates)
+  cnt = LOOT.where(id: id.to_i).update(updates)
   halt 404, { error: "not found" }.to_json if cnt == 0
-  row_to_loot(LOOT_ITEMS.where(id: id.to_i).first).to_json
+  row_to_loot(LOOT.where(id: id.to_i).first).to_json
 end
 
 # Delete loot
 delete "/loot/:id" do |id|
-  cnt = LOOT_ITEMS.where(id: id.to_i).delete
+  cnt = LOOT.where(id: id.to_i).delete
   halt 404, { error: "not found" }.to_json if cnt == 0
   { ok: true }.to_json
 end
@@ -415,7 +332,7 @@ get "/enemies/:id/loot" do |id|
   halt 404, { error: "enemy not found" }.to_json unless ENEMIES.where(id: eid).first
   rows = ENEMY_LOOT.where(enemy_id: eid).all
   payload = rows.map do |r|
-    loot = LOOT_ITEMS.where(id: r[:loot_id]).first
+    loot = LOOT.where(id: r[:loot_id]).first
     next nil unless loot
     { loot: row_to_loot(loot), weight: r[:weight] }
   end.compact
@@ -429,7 +346,7 @@ post "/enemies/:id/loot" do |id|
   loot_id = b["loot_id"].to_i
   weight = (b["weight"] || 1).to_i
   halt 404, { error: "enemy not found" }.to_json unless ENEMIES.where(id: eid).first
-  halt 404, { error: "loot not found" }.to_json unless LOOT_ITEMS.where(id: loot_id).first
+  halt 404, { error: "loot not found" }.to_json unless LOOT.where(id: loot_id).first
   ENEMY_LOOT.insert_conflict(target: [:enemy_id, :loot_id], update: { weight: weight, updated_at: now_iso })
            .insert(enemy_id: eid, loot_id: loot_id, weight: weight, updated_at: now_iso)
   { ok: true }.to_json
@@ -453,196 +370,10 @@ delete "/enemies/:id/loot/:loot_id" do |id, loot_id|
   { ok: true }.to_json
 end
 
-# ---------------- Location CRUD ----------------
+# ---------------- Quest resolution ----------------
 
-# List locations
-get "/api/locations" do
-  LOCATION_TEMPLATES.order(:id).all.to_json
-end
-
-# Create location
-post "/api/locations" do
-  b = json_body
-  name = (b["name"] || "").strip
-  desc = (b["description"] || "").strip
-  type = (b["type"] || "generic").strip
-  halt 400, { error: "name and description required" }.to_json if name.empty? || desc.empty?
-
-  id = LOCATION_TEMPLATES.insert(
-    name: name,
-    description: desc,
-    type: type,
-    updated_at: now_iso
-  )
-  LOCATION_TEMPLATES.where(id: id).first.to_json
-end
-
-# Read location
-get "/api/locations/:id" do |id|
-  loc = LOCATION_TEMPLATES.where(id: id.to_i).first
-  halt 404, { error: "not found" }.to_json unless loc
-  loc.to_json
-end
-
-# Update location
-put "/api/locations/:id" do |id|
-  b = json_body
-  updates = { updated_at: now_iso }
-  updates[:name] = b["name"].strip if b["name"]
-  updates[:description] = b["description"].strip if b["description"]
-  updates[:type] = b["type"].strip if b["type"]
-
-  cnt = LOCATION_TEMPLATES.where(id: id.to_i).update(updates)
-  halt 404, { error: "not found" }.to_json if cnt == 0
-  LOCATION_TEMPLATES.where(id: id.to_i).first.to_json
-end
-
-# Delete location
-delete "/api/locations/:id" do |id|
-  cnt = LOCATION_TEMPLATES.where(id: id.to_i).delete
-  halt 404, { error: "not found" }.to_json if cnt == 0
-  { ok: true }.to_json
-end
-
-# ---- Quests ----
-
-# Get the character's current quest state.
-# If they have no quest, a new one is generated.
-get "/quests/current" do
-  character_id = params["character_id"]
-  halt 400, { error: "character_id is required" }.to_json unless character_id
-
-  state = QuestManager.get_current_quest(character_id) || QuestManager.generate_new_quest(character_id)
-
-  halt 200, {}.to_json unless state
-
-  quest = state[:quest]
-  current_node = quest.get_node(state[:current_node_id])
-
-  connections = current_node.connections.map do |conn_id|
-    node = quest.get_node(conn_id)
-    { id: node.id, name: node.name }
-  end
-
-  {
-    quest_name: quest.name,
-    location: {
-      id: current_node.id,
-      name: current_node.name,
-      description: current_node.description
-    },
-    connections: connections,
-    completed: state[:current_node_id] == quest.end_node_id
-  }.to_json
-end
-
-# Perform an action within a quest.
-# Body: { character_id: "...", action: "...", ... }
-# Returns: { description: "...", rewards: [...] }
-post "/quests/action" do
-  body = json_body
-  character_id = body["character_id"]
-  action = body["action"]
-  halt 400, { error: "character_id and action are required" }.to_json unless character_id && action
-
-  state = QuestManager.get_current_quest(character_id)
-  halt 404, { error: "no active quest found" }.to_json unless state
-
-  quest = state[:quest]
-  current_node_id = state[:current_node_id]
-  outcome = nil
-
-  case action
-  when "travel"
-    destination_id = body["destination_id"]
-    current_node = quest.get_node(current_node_id)
-    halt 400, { error: "invalid destination" }.to_json unless current_node.connections.include?(destination_id)
-
-    QuestManager.update_quest_location(character_id, current_node_id, destination_id)
-
-    encounter = quest.travel_encounters.sample
-    log_message = "Traveling to #{quest.get_node(destination_id).name}... "
-
-    if encounter && encounter.enemy_id
-      # Resolve combat encounter
-      loot_rows = ENEMY_LOOT.where(enemy_id: encounter.enemy_id).all
-      loot_item = nil
-      if loot_rows.any?
-        picked = weighted_roll(loot_rows)
-        loot_item = LOOT_ITEMS.where(id: picked[:loot_id]).first if picked
-      end
-      xp_gain = rand(18..32)
-      loot = loot_item ? [row_to_loot(loot_item)] : []
-      rewards = [{type: :xp, value: xp_gain}] + loot.map{|l| {type: :loot, value: l}}
-
-      outcome = {
-        log: log_message + "#{encounter.description} You won, gaining #{xp_gain} XP.",
-        rewards: rewards
-      }
-    else
-      # Peaceful encounter
-      outcome = {
-        log: log_message + (encounter ? encounter.description : "The journey is uneventful."),
-        rewards: []
-      }
-    end
-
-  when "explore"
-    current_node = quest.get_node(current_node_id)
-    encounter = current_node.encounters.sample # Assuming one encounter per node
-
-    if encounter && encounter.enemy_id
-      # Resolve combat encounter
-      resolution_payload = { character: char, enemy_id: encounter.enemy_id }
-
-      # Making a request to our own endpoint is a bit weird.
-      # A better way would be to refactor the resolution logic into a shared module.
-      # For now, we'll simulate the call.
-      # This is a simplified version of the logic in /quests/resolve_encounter
-      loot_rows = ENEMY_LOOT.where(enemy_id: encounter.enemy_id).all
-      loot_item = nil
-      if loot_rows.any?
-        picked = weighted_roll(loot_rows)
-        loot_item = LOOT_ITEMS.where(id: picked[:loot_id]).first if picked
-      end
-      xp_gain = rand(18..32)
-      loot = loot_item ? [row_to_loot(loot_item)] : []
-      rewards = [{type: :xp, value: xp_gain}] + loot.map{|l| {type: :loot, value: l}}
-
-      outcome = {
-        log: "#{encounter.description} You won, gaining #{xp_gain} XP.",
-        rewards: rewards
-      }
-    else
-      # Peaceful encounter
-      outcome = {
-        log: encounter ? encounter.description : "The area is peaceful.",
-        rewards: []
-      }
-    end
-
-  else
-    halt 400, { error: "unknown action" }.to_json
-  end
-
-  # TODO: Persist the outcome as an event
-  outcome.to_json
-end
-
-# Clear a character's completed quest
-post "/quests/complete" do
-  body = json_body
-  character_id = body["character_id"]
-  halt 400, { error: "character_id is required" }.to_json unless character_id
-
-  ACTIVE_QUESTS.where(character_id: character_id).delete
-  { ok: true }.to_json
-end
-
-# This endpoint is no longer called directly by the overlay, but is used
-# by the point-crawl system to resolve encounters with enemies.
 # Request body can include { enemy_id }
-post "/quests/resolve_encounter" do
+post "/quests/resolve" do
   payload = json_body
   char = payload["character"] || {}
   enemy_id = payload["enemy_id"]
@@ -658,13 +389,13 @@ post "/quests/resolve_encounter" do
   if loot_rows.any?
     picked = weighted_roll(loot_rows)
     if picked
-      loot_item = LOOT_ITEMS.where(id: picked[:loot_id]).first
+      loot_item = LOOT.where(id: picked[:loot_id]).first
     end
   end
 
   # If no enemy mapping or empty table, roll 60% chance on any loot
   if loot_item.nil?
-    all = LOOT_ITEMS.all
+    all = LOOT.all
     loot_item = all.sample if rand < 0.6 && all.any?
   end
 
@@ -689,8 +420,7 @@ post "/quests/resolve_encounter" do
   outcome.to_json
 end
 
-
-# ---- Debug helpers ----
+# ---------------- Debug ----------------
 
 get "/debug/characters" do
   CHARACTERS.order(Sequel.desc(:updated_at)).all.map { |r| JSON.parse(r[:json]) }.to_json

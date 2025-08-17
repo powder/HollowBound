@@ -20,16 +20,16 @@ module PointCrawl
 
   # Represents a single encounter that can happen at a PointOfInterest.
   class Encounter
-    attr_reader :id, :description, :rewards
+    attr_reader :id, :description, :enemy_id
 
-    def initialize(id: SecureRandom.hex(4), description:, rewards: [])
+    def initialize(id: SecureRandom.hex(4), description:, enemy_id: nil)
       @id = id
       @description = description
-      @rewards = rewards
+      @enemy_id = enemy_id
     end
 
     def to_h
-      { id: @id, description: @description, rewards: @rewards.map(&:to_h) }
+      { id: @id, description: @description, enemy_id: @enemy_id }
     end
   end
 
@@ -111,19 +111,25 @@ module PointCrawl
       quest.start_node_id = hash['start_node_id']
       quest.end_node_id = hash['end_node_id']
 
-      hash['nodes'].each do |node_id, node_hash|
+      (hash['nodes'] || {}).each do |node_id, node_hash|
         poi = PointOfInterest.new(node_hash['id'], node_hash['name'], node_hash['description'], type: node_hash['type'].to_sym)
-        node_hash['connections'].each { |conn_id| poi.add_connection(conn_id) }
-        node_hash['encounters'].each do |enc_hash|
-          rewards = enc_hash['rewards'].map { |r| Reward.new(r['type'].to_sym, r['value']) }
-          poi.add_encounter(Encounter.new(id: enc_hash['id'], description: enc_hash['description'], rewards: rewards))
+        (node_hash['connections'] || []).each { |conn_id| poi.add_connection(conn_id) }
+        (node_hash['encounters'] || []).each do |enc_hash|
+          poi.add_encounter(Encounter.new(
+            id: enc_hash['id'],
+            description: enc_hash['description'],
+            enemy_id: enc_hash['enemy_id']
+          ))
         end
         quest.add_node(poi)
       end
 
-      hash['travel_encounters'].each do |enc_hash|
-        rewards = enc_hash['rewards'].map { |r| Reward.new(r['type'].to_sym, r['value']) }
-        quest.add_travel_encounter(Encounter.new(id: enc_hash['id'], description: enc_hash['description'], rewards: rewards))
+      (hash['travel_encounters'] || []).each do |enc_hash|
+        quest.add_travel_encounter(Encounter.new(
+          id: enc_hash['id'],
+          description: enc_hash['description'],
+          enemy_id: enc_hash['enemy_id']
+        ))
       end
 
       quest

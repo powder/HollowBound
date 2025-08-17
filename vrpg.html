@@ -88,8 +88,7 @@
     </div>
 
     <div class="quest">
-      <div class="quest-title" id="questTitle">Quest: Placeholder title</div>
-      <div class="bar"><div class="fill" id="questFill"></div></div>
+      <div class="quest-title" id="questTitle">Location: Unknown</div>
     </div>
 
     <div class="log" id="log"></div>
@@ -188,6 +187,10 @@
     el.stats.textContent = Object.entries(c.stats).map(([k,v]) => `${k.toUpperCase()}:${v}`).join("  ");
     el.xp.textContent = nfmt(c.xp);
     el.nxt.textContent = nfmt(c.next_level_xp);
+
+    if (currentQuestState) {
+      el.questTitle.textContent = `Location: ${currentQuestState.location.name}`;
+    }
   }
 
   // Log with timed fade
@@ -202,44 +205,38 @@
     while (el.log.children.length > maxLines) el.log.lastElementChild?.remove();
   }
 
-  // Quest visuals
-  const quest = { active:false, title:"Placeholder title", start:0, duration:6000 };
-  const setQuestTitle = t => { quest.title = t || "Placeholder title"; el.questTitle.textContent = `Quest: ${quest.title}`; };
-  const startQuest = ms => { quest.active = true; quest.start = performance.now(); quest.duration = ms; };
-  const raf = () => {
-    if (quest.active) {
-      const pct = clamp((performance.now() - quest.start) / quest.duration, 0, 1);
-      el.questFill.style.width = `${Math.floor(pct * 100)}%`;
-      if (pct >= 1) quest.active = false;
-    }
-    requestAnimationFrame(raf);
-  };
-  requestAnimationFrame(raf);
+  // Quest State
+  let currentQuestState = null;
 
-  async function getQuestTitle() {
-    if (!server) return "A Rumor of Riches";
-    const data = await fetchJSON(`${server}/quests/current_title?character_id=${encodeURIComponent(charId)}`);
-    return (data && data.title) || "A Rumor of Riches";
+  // New Quest API
+  async function getCurrentQuestState() {
+    if (!server) return null;
+    return await fetchJSON(`${server}/quests/current?character_id=${encodeURIComponent(charId)}`);
   }
-
-  // Backend-driven quest outcome, with offline fallback
-  async function resolveQuestOutcome(char) {
-    if (server) {
-      const resp = await postJSON(`${server}/quests/resolve`, { character: char });
-      if (resp && typeof resp.xp === "number") {
-        return { xp: resp.xp, loot: Array.isArray(resp.loot) ? resp.loot : [] };
-      }
-    }
-    const xp = 20 + Math.floor(Math.random() * 25);
-    const loot = Math.random() < 0.5 ? [randomLoot()] : [];
-    return { xp, loot };
+  async function postQuestAction(actionPayload) {
+    if (!server) return null;
+    return await postJSON(`${server}/quests/action`, { character_id: charId, ...actionPayload });
   }
 
   // Sim core
   const moreRecent = (a,b) => new Date(a.updated_at) > new Date(b.updated_at) ? a : b;
-  const decideAction = c => {
-    const s = { quest: c.wants.xp*0.7 + c.wants.loot*0.7 + (1-c.needs.fatigue)*0.3, rest: c.needs.fatigue*0.8 + c.wants.rest*0.2 };
-    return s.quest >= s.rest ? "quest" : "rest";
+  const decideAction = (c, questState) => {
+    // Simple AI:
+    // 1. If there are unvisited connections, travel to one.
+    // 2. Otherwise, explore the current location.
+    const unvisited = questState.connections; // In a future version, we'd filter this by a list of visited nodes.
+    if (unvisited.length > 0) {
+      const destination = pick(unvisited);
+      return {
+        logMessage: `travel to ${destination.name}`,
+        payload: { action: "travel", destination_id: destination.id }
+      };
+    } else {
+      return {
+        logMessage: `explore ${questState.location.name}`,
+        payload: { action: "explore" }
+      };
+    }
   };
   const gainXP = (c, amount) => {
     c.xp += amount; let leveled = false;
@@ -341,76 +338,82 @@
   }
 
   // Action loop
-  let runningAction = null;
-
   async function startActionLoop() {
     async function loop() {
-      // Complete quest
-      if (runningAction === "quest" && !quest.active) {
-        const outcome = await resolveQuestOutcome(currentChar);
-        const leveled = gainXP(currentChar, outcome.xp);
-        currentChar.needs.fatigue = clamp(currentChar.needs.fatigue + 0.2, 0, 1);
-        if (Array.isArray(outcome.loot)) for (const it of outcome.loot) currentChar.inventory.push({ ...it });
-        currentChar.updated_at = nowIso();
-
-        await idbPut("snapshots", currentChar);
-        await pushSnapshot(currentChar);
-        await recordEvent("quest_result", outcome);
-
-        pushLog(`Quest complete. +${outcome.xp}`);
-        if (outcome.loot && outcome.loot.length) pushLog(`Found ${outcome.loot.map(l=>l.name).join(", ")}.`);
-        if (leveled) pushLog(`Level up to ${currentChar.level}!`);
-        render(currentChar);
-        runningAction = null;
+      if (userEditing) {
+        setTimeout(loop, 2000); // Wait if user is editing
+        return;
       }
 
-      // Complete rest
-      if (runningAction === "rest" && !quest.active) {
-        currentChar.needs.fatigue = clamp(currentChar.needs.fatigue - 0.35, 0, 1);
-        currentChar.updated_at = nowIso();
+      // 1. Get current quest state
+      currentQuestState = await getCurrentQuestState();
+      if (!currentQuestState) {
+        pushLog("Could not retrieve quest state from server.");
+        setTimeout(loop, 10000); // Wait longer before retrying
+        return;
+      }
+      render(currentChar); // Update location display
 
-        await idbPut("snapshots", currentChar);
-        await pushSnapshot(currentChar);
-        await recordEvent("rest", {});
-
-        pushLog("Resting complete.");
-        render(currentChar);
-        runningAction = null;
+      // 2. Handle completed quest
+      if (currentQuestState.completed) {
+        pushLog(`Finished quest: ${currentQuestState.quest_name}! Taking a long rest.`);
+        // In a real implementation, we might delete the quest on the server
+        // so a new one generates on the next loop. For now, we just stop.
+        setTimeout(loop, 20000); // Wait a long time before next quest
+        return;
       }
 
-      // Start next action only if not editing
-      if (!runningAction && !userEditing) {
-        const action = decideAction(currentChar);
-        if (action === "quest") {
-          setQuestTitle(await getQuestTitle());
-          startQuest(6000);
-          runningAction = "quest";
-          pushLog("Setting out on a quest...");
-        } else {
-          setQuestTitle("Taking a breather");
-          startQuest(4000);
-          runningAction = "rest";
-          pushLog("Taking a rest...");
+      // 3. Decide on the next action
+      const action = decideAction(currentChar, currentQuestState);
+      pushLog(`I think I will ${action.logMessage}...`);
+
+      // 4. Post action to server and get outcome
+      const outcome = await postQuestAction(action.payload);
+      if (!outcome) {
+        pushLog("...but something went wrong.");
+        setTimeout(loop, 5000);
+        return;
+      }
+
+      // 5. Process outcome
+      pushLog(outcome.log);
+      let leveled = false;
+      const foundLoot = [];
+      if (Array.isArray(outcome.rewards)) {
+        for (const reward of outcome.rewards) {
+          if (reward.type === 'xp' && reward.value > 0) {
+            if (gainXP(currentChar, reward.value)) leveled = true;
+          }
+          if (reward.type === 'loot') {
+            currentChar.inventory.push(reward.value);
+            foundLoot.push(reward.value.name);
+          }
         }
       }
 
-      // Outbox flush
-      flushOutbox();
+      currentChar.updated_at = nowIso();
+      await idbPut("snapshots", currentChar);
+      await pushSnapshot(currentChar);
+      await recordEvent("quest_action", { action: action.payload, outcome: outcome });
 
-      // Remote pull with edit-safe merge
+      if (foundLoot.length > 0) pushLog(`Found ${foundLoot.join(', ')}.`);
+      if (leveled) pushLog(`Level up to ${currentChar.level}!`);
+      render(currentChar);
+
+      // 6. Outbox flush and remote sync
+      flushOutbox();
       if (server) {
         const remote = await fetchJSON(`${server}/character/${charId}`);
         if (remote) {
           const local = (await idbGet("snapshots", charId)) || currentChar;
-          let chosen = local;
-          if (moreRecent(local, remote) === remote) chosen = mergeRemotePreservingEdits(local, remote);
-          currentChar = chosen;
+          currentChar = moreRecent(local, remote) === remote ? mergeRemotePreservingEdits(local, remote) : local;
           await idbPut("snapshots", currentChar);
           render(currentChar);
         }
       }
 
-      setTimeout(loop, 500);
+      // 7. Wait and repeat
+      setTimeout(loop, 4000 + Math.random() * 2000); // Wait 4-6 seconds
     }
     loop();
   }

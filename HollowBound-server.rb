@@ -5,6 +5,9 @@ require "sequel"
 require "securerandom"
 require "time"
 
+require_relative "lib/point_crawl"
+require_relative "lib/quest_generator"
+
 set :bind, "0.0.0.0"
 set :port, 4567
 
@@ -28,8 +31,65 @@ DB.create_table?(:events) do
   index   :updated_at
 end
 
+DB.create_table?(:character_quests) do
+  String :character_id, primary_key: true
+  Text   :quest_json, null: false
+  String :current_node_id, null: false
+  Text   :completed_nodes_json, null: false # JSON array of strings
+  String :updated_at, null: false
+end
+
 CHARACTERS = DB[:characters]
 EVENTS     = DB[:events]
+QUESTS     = DB[:character_quests]
+
+# ---- Quest Management ----
+module QuestManager
+  def self.get_current_quest(character_id)
+    row = QUESTS.where(character_id: character_id).first
+    return nil unless row
+
+    quest = PointCrawl::Quest.from_h(JSON.parse(row[:quest_json]))
+    {
+      quest: quest,
+      current_node_id: row[:current_node_id],
+      completed_nodes: JSON.parse(row[:completed_nodes_json])
+    }
+  end
+
+  def self.generate_new_quest(character_id)
+    quest = PointCrawl::QuestGenerator.generate("quest_#{SecureRandom.hex(4)}")
+    start_node_id = quest.start_node_id
+
+    QUESTS.insert(
+      character_id: character_id,
+      quest_json: quest.to_h.to_json,
+      current_node_id: start_node_id,
+      completed_nodes_json: [].to_json,
+      updated_at: Time.now.utc.iso8601
+    )
+
+    {
+      quest: quest,
+      current_node_id: start_node_id,
+      completed_nodes: []
+    }
+  end
+
+  def self.update_quest_location(character_id, old_node_id, new_node_id)
+    row = QUESTS.where(character_id: character_id).first
+    return unless row # Or handle error
+
+    completed = JSON.parse(row[:completed_nodes_json])
+    completed << old_node_id unless completed.include?(old_node_id)
+
+    QUESTS.where(character_id: character_id).update(
+      current_node_id: new_node_id,
+      completed_nodes_json: completed.to_json,
+      updated_at: Time.now.utc.iso8601
+    )
+  end
+end
 
 helpers do
   def json_body
@@ -141,45 +201,77 @@ end
 
 # ---- Quests ----
 
-# Return a quest title for a character
-get "/quests/current_title" do
-  char_id = params["character_id"]
-  titles = [
-    "Goblin Troubles",
-    "The Lost Amulet",
-    "A Rumor of Riches",
-    "Bandits on the Road",
-    "Crypt of Forgotten Kings"
-  ]
-  { title: titles.sample, character_id: char_id }.to_json
+# Get the character's current quest state.
+# If they have no quest, a new one is generated.
+get "/quests/current" do
+  character_id = params["character_id"]
+  halt 400, { error: "character_id is required" }.to_json unless character_id
+
+  state = QuestManager.get_current_quest(character_id) || QuestManager.generate_new_quest(character_id)
+
+  quest = state[:quest]
+  current_node = quest.get_node(state[:current_node_id])
+
+  connections = current_node.connections.map do |conn_id|
+    node = quest.get_node(conn_id)
+    { id: node.id, name: node.name }
+  end
+
+  {
+    quest_name: quest.name,
+    location: {
+      id: current_node.id,
+      name: current_node.name,
+      description: current_node.description
+    },
+    connections: connections,
+    completed: state[:current_node_id] == quest.end_node_id
+  }.to_json
 end
 
-# Resolve a quest outcome
-# Body: { character: { ...snapshot... } }
-# Returns: { xp: Integer, loot: [ {key, name, effects} ] }
-post "/quests/resolve" do
-  payload = json_body
-  char = payload["character"] || {}
-  xp_gain = rand(18..32)
-  loot = []
-  loot << loot_table.sample if rand < 0.6
+# Perform an action within a quest.
+# Body: { character_id: "...", action: "...", ... }
+# Returns: { description: "...", rewards: [...] }
+post "/quests/action" do
+  body = json_body
+  character_id = body["character_id"]
+  action = body["action"]
+  halt 400, { error: "character_id and action are required" }.to_json unless character_id && action
 
-  outcome = { xp: xp_gain, loot: loot }
+  state = QuestManager.get_current_quest(character_id)
+  halt 404, { error: "no active quest found" }.to_json unless state
 
-  # Persist the event
-  EVENTS.insert(id: "ev_#{SecureRandom.hex(6)}",
-                character_id: char["id"] || "unknown",
-                json: {
-                  id: "ev_#{SecureRandom.hex(4)}",
-                  type: "event",
-                  kind: "quest_result",
-                  payload: outcome,
-                  character_id: char["id"],
-                  updated_at: now_iso,
-                  version: 1
-                }.to_json,
-                updated_at: now_iso)
+  quest = state[:quest]
+  current_node_id = state[:current_node_id]
+  outcome = nil
 
+  case action
+  when "travel"
+    destination_id = body["destination_id"]
+    current_node = quest.get_node(current_node_id)
+    halt 400, { error: "invalid destination" }.to_json unless current_node.connections.include?(destination_id)
+
+    QuestManager.update_quest_location(character_id, current_node_id, destination_id)
+
+    encounter = quest.travel_encounters.sample
+    outcome = {
+      log: "Traveling to #{quest.get_node(destination_id).name}... #{encounter.description}",
+      rewards: encounter.rewards.map(&:to_h)
+    }
+
+  when "explore"
+    current_node = quest.get_node(current_node_id)
+    encounter = current_node.encounters.sample
+    outcome = {
+      log: "Exploring #{current_node.name}... #{encounter.description}",
+      rewards: encounter.rewards.map(&:to_h)
+    }
+
+  else
+    halt 400, { error: "unknown action" }.to_json
+  end
+
+  # TODO: Persist the outcome as an event
   outcome.to_json
 end
 

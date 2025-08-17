@@ -1,0 +1,432 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Virtual RPG Character</title>
+  <style>
+    :root {
+      --bg: rgba(0,0,0,0.55);
+      --fg: #eaeaea;
+      --muted: #b7b7b7;
+      --accent: #76c7ff;
+      --fade: 0.25;
+      --radius: 12px;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body { font: 14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--fg); background: rgba(0,0,0,0); }
+
+    /* Grid with log spanning both columns */
+    .wrap {
+      display: grid;
+      grid-template-columns: 84px 1fr;
+      grid-template-rows: auto auto auto minmax(0, 1fr);
+      grid-template-areas:
+        "window header"
+        "window info"
+        "window quest"
+        "log    log";
+      gap: 8px 10px;
+      padding: 10px;
+      width: 360px;
+      background: var(--bg);
+      border-radius: var(--radius);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.35);
+      overflow: hidden;
+    }
+
+    .window {
+      grid-area: window;
+      width: 84px; height: 84px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.12);
+      display: grid; place-items: center;
+      color: var(--muted);
+      font-size: 10px;
+      user-select: none;
+    }
+
+    .header { grid-area: header; display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+    .name { font-weight: 700; font-size: 16px; }
+    .class { color: var(--muted); font-size: 12px; }
+    .level { margin-left: auto; font-weight: 600; }
+
+    .info { grid-area: info; display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; min-width: 0; }
+    .stats { color: var(--muted); font-size: 12px; white-space: normal; line-height: 1.1; min-width: 0; }
+    .badge { padding: 2px 6px; border-radius: 999px; background: rgba(255,255,255,0.1); font-size: 11px; white-space: nowrap; }
+
+    .quest { grid-area: quest; display: grid; gap: 4px; min-width: 0; }
+    .quest-title { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .bar { width: 100%; height: 8px; border-radius: 999px; overflow: hidden; background: rgba(255,255,255,0.10); }
+    .bar > .fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.15s linear; }
+
+    .log { grid-area: log; display: grid; gap: 2px; min-height: 64px; max-height: 160px; overflow: hidden; padding-top: 2px; }
+    .log-line { font-size: 12px; opacity: 0.95; transition: opacity 1.6s ease; }
+    .log-line.fade { opacity: var(--fade); }
+
+    /* Inline editing */
+    .editable { outline: none; border-radius: 4px; }
+    .editable:not(.editing):hover { text-decoration: underline; text-decoration-style: dotted; cursor: text; }
+    .editing { background: rgba(255,255,255,0.08); box-shadow: 0 0 0 1px rgba(255,255,255,0.15) inset; padding: 0 2px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="window" id="charWindow"></div>
+
+    <div class="header">
+      <div class="name editable" id="name" role="textbox" aria-label="Character name" tabindex="0"></div>
+      <div class="class editable" id="class" role="textbox" aria-label="Character class" tabindex="0"></div>
+      <div class="level" id="level"></div>
+    </div>
+
+    <div class="info">
+      <div class="stats" id="stats"></div>
+      <div class="badge">XP <span id="xp"></span>/<span id="nxt"></span></div>
+    </div>
+
+    <div class="quest">
+      <div class="quest-title" id="questTitle">Quest: Placeholder title</div>
+      <div class="bar"><div class="fill" id="questFill"></div></div>
+    </div>
+
+    <div class="log" id="log"></div>
+  </div>
+
+  <script>
+  // Utilities
+  const nowIso = () => new Date().toISOString();
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const pick = a => a[Math.floor(Math.random() * a.length)];
+  const nfmt = n => Number(n).toLocaleString();
+  const sanitize = s => s.replace(/\s+/g, " ").replace(/[^\p{L}\p{N} '._-]/gu, "").trim();
+
+  // Elements
+  const el = {
+    name: document.getElementById("name"),
+    klass: document.getElementById("class"),
+    level: document.getElementById("level"),
+    stats: document.getElementById("stats"),
+    xp: document.getElementById("xp"),
+    nxt: document.getElementById("nxt"),
+    log: document.getElementById("log"),
+    questFill: document.getElementById("questFill"),
+    questTitle: document.getElementById("questTitle"),
+    win: document.getElementById("charWindow")
+  };
+
+  // Params
+  const params = new URLSearchParams(location.search);
+  const server = params.get("server") || "localhost:4567";
+  const charId = params.get("char_id") || "char_01";
+
+  // IndexedDB
+  const dbp = new Promise((resolve, reject) => {
+    const req = indexedDB.open("rpg_widget_db", 7);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains("snapshots")) db.createObjectStore("snapshots", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("outbox")) db.createObjectStore("outbox", { keyPath: "id" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  const idbGet = async (s, k) => new Promise(async (res, rej) => {
+    const db = await dbp; const tx = db.transaction(s, "readonly"); const st = tx.objectStore(s);
+    const r = st.get(k); r.onsuccess = () => res(r.result || null); r.onerror = () => rej(r.error);
+  });
+  const idbPut = async (s, v) => new Promise(async (res, rej) => {
+    const db = await dbp; const tx = db.transaction(s, "readwrite");
+    tx.oncomplete = () => res(true); tx.onerror = () => rej(tx.error); tx.objectStore(s).put(v);
+  });
+  const idbAll = async s => new Promise(async (res, rej) => {
+    const db = await dbp; const tx = db.transaction(s, "readonly"); const st = tx.objectStore(s);
+    const out = []; const cur = st.openCursor();
+    cur.onsuccess = e => { const c = e.target.result; if (c) { out.push(c.value); c.continue(); } else res(out); };
+    cur.onerror = () => rej(cur.error);
+  });
+  const idbDelete = async (s, k) => new Promise(async (res, rej) => {
+    const db = await dbp; const tx = db.transaction(s, "readwrite");
+    tx.oncomplete = () => res(true); tx.onerror = () => rej(tx.error); tx.objectStore(s).delete(k);
+  });
+
+  // Net helpers
+  const fetchJSON = async url => { try { const r = await fetch(url, { cache: "no-store" }); if (!r.ok) throw 0; return await r.json(); } catch { return null; } };
+  const postJSON  = async (url, body) => { try { const r = await fetch(url, { method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify(body) }); if (!r.ok) return null; try { return await r.json(); } catch { return { ok: true }; } } catch { return null; } };
+  const putJSON   = async (url, body) => { try { const r = await fetch(url, { method: "PUT",  headers: { "Content-Type":"application/json" }, body: JSON.stringify(body) }); return r.ok; } catch { return false; } };
+  async function pushSnapshot(c) { if (!server) return; await putJSON(`${server}/character/${c.id}`, c); }
+
+  // Game math
+  const nextLevelXP = l => Math.round(50 * l * l + 100 * l);
+  const newCharacter = ({ id, name, klass }) => ({
+    id, type:"character", updated_at: nowIso(), version: 1,
+    name: name || "Adventurer",
+    class: klass || "Fighter",
+    level: 1, xp: 0, next_level_xp: nextLevelXP(1),
+    stats: { str: 12, dex: 10, con: 12, int: 10, wis: 10, cha: 10 },
+    abilities: [],
+    wants: { loot: 0.4, xp: 0.5, craft: 0.05, rest: 0.05 },
+    needs: { fatigue: 0.0, hunger: 0.0, repairs: 0.0 },
+    equipment: [], inventory: []
+  });
+
+  // Editing guards
+  let editingName = false;
+  let editingClass = false;
+  let userEditing = false; // pauses starting new actions
+
+  // Current character
+  let currentChar = null;
+
+  // Render respecting live edits
+  function render(c) {
+    if (!editingName) el.name.textContent = c.name;
+    if (!editingClass) el.klass.textContent = `(${c.class})`;
+    el.level.textContent = `Lv ${c.level}`;
+    el.stats.textContent = Object.entries(c.stats).map(([k,v]) => `${k.toUpperCase()}:${v}`).join("  ");
+    el.xp.textContent = nfmt(c.xp);
+    el.nxt.textContent = nfmt(c.next_level_xp);
+  }
+
+  // Log with timed fade
+  function pushLog(line) {
+    const div = document.createElement("div");
+    div.className = "log-line";
+    div.textContent = line;
+    el.log.prepend(div);
+    setTimeout(() => div.classList.add("fade"), 40000);
+    setTimeout(() => div.remove(), 42000);
+    const maxLines = 20;
+    while (el.log.children.length > maxLines) el.log.lastElementChild?.remove();
+  }
+
+  // Quest visuals
+  const quest = { active:false, title:"Placeholder title", start:0, duration:6000 };
+  const setQuestTitle = t => { quest.title = t || "Placeholder title"; el.questTitle.textContent = `Quest: ${quest.title}`; };
+  const startQuest = ms => { quest.active = true; quest.start = performance.now(); quest.duration = ms; };
+  const raf = () => {
+    if (quest.active) {
+      const pct = clamp((performance.now() - quest.start) / quest.duration, 0, 1);
+      el.questFill.style.width = `${Math.floor(pct * 100)}%`;
+      if (pct >= 1) quest.active = false;
+    }
+    requestAnimationFrame(raf);
+  };
+  requestAnimationFrame(raf);
+
+  async function getQuestTitle() {
+    if (!server) return "A Rumor of Riches";
+    const data = await fetchJSON(`${server}/quests/current_title?character_id=${encodeURIComponent(charId)}`);
+    return (data && data.title) || "A Rumor of Riches";
+  }
+
+  // Backend-driven quest outcome, with offline fallback
+  async function resolveQuestOutcome(char) {
+    if (server) {
+      const resp = await postJSON(`${server}/quests/resolve`, { character: char });
+      if (resp && typeof resp.xp === "number") {
+        return { xp: resp.xp, loot: Array.isArray(resp.loot) ? resp.loot : [] };
+      }
+    }
+    const xp = 20 + Math.floor(Math.random() * 25);
+    const loot = Math.random() < 0.5 ? [randomLoot()] : [];
+    return { xp, loot };
+  }
+
+  // Sim core
+  const moreRecent = (a,b) => new Date(a.updated_at) > new Date(b.updated_at) ? a : b;
+  const decideAction = c => {
+    const s = { quest: c.wants.xp*0.7 + c.wants.loot*0.7 + (1-c.needs.fatigue)*0.3, rest: c.needs.fatigue*0.8 + c.wants.rest*0.2 };
+    return s.quest >= s.rest ? "quest" : "rest";
+  };
+  const gainXP = (c, amount) => {
+    c.xp += amount; let leveled = false;
+    while (c.xp >= c.next_level_xp) {
+      c.level += 1; c.next_level_xp = nextLevelXP(c.level);
+      if (c.level % 3 === 0) c.stats.str += 1;
+      if (c.level % 2 === 0) c.stats.dex += 1;
+      leveled = true;
+    }
+    return leveled;
+  };
+  const randomLoot = () => pick([
+    { key:"short_sword", name:"Short Sword", effects:{ atk:2 } },
+    { key:"leather_cap", name:"Leather Cap", effects:{ ac:1 } },
+    { key:"healing_poultice", name:"Healing Poultice", effects:{ heal:10 } }
+  ]);
+  const recordEvent = async (kind, payload) => idbPut("outbox", { id:`ev_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, type:"event", character_id: charId, kind, payload, updated_at: nowIso(), version:1 });
+  const flushOutbox = async () => {
+    if (!server) return;
+    const batch = await idbAll("outbox");
+    if (!batch.length) return;
+    const posted = await postJSON(`${server}/events/batch`, { events: batch });
+    if (posted) for (const ev of batch) await idbDelete("outbox", ev.id);
+  };
+
+  // Load snapshot
+  async function loadSnapshot() {
+    const cached = await idbGet("snapshots", charId);
+    const remote = server ? await fetchJSON(`${server}/character/${charId}`) : null;
+    if (cached && remote) { const chosen = moreRecent(cached, remote); if (chosen === remote) await idbPut("snapshots", remote); return chosen; }
+    if (remote) { await idbPut("snapshots", remote); return remote; }
+    if (cached) return cached;
+    const created = newCharacter({ id: charId, name: params.get("name"), klass: params.get("class") });
+    await idbPut("snapshots", created);
+    return created;
+  }
+
+  // Merge remote while preserving edits
+  function mergeRemotePreservingEdits(local, remote) {
+    const merged = { ...remote };
+    if (editingName) merged.name = local.name;
+    if (editingClass) merged.class = local.class;
+    return merged;
+  }
+
+  // Inline editing
+  function enableInlineEdit(element, field, opts = {}) {
+    const maxLen = opts.maxLen || 32;
+    const setFlag = v => {
+      if (field === "name") editingName = v; else editingClass = v;
+      userEditing = editingName || editingClass;
+    };
+
+    function begin() {
+      setFlag(true);
+      element.classList.add("editing");
+      element.contentEditable = "true";
+      const r = document.createRange(); r.selectNodeContents(element);
+      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    }
+
+    async function commit() {
+      if (!element.isContentEditable) return;
+      setFlag(false);
+      element.classList.remove("editing");
+      element.contentEditable = "false";
+      const newText = sanitize(element.textContent).slice(0, maxLen);
+      const prevText = field === "name" ? currentChar.name : currentChar.class;
+      if (!newText) { element.textContent = prevText; return; }
+      if (newText === prevText) return;
+
+      if (field === "name") currentChar.name = newText; else currentChar.class = newText;
+      currentChar.updated_at = nowIso();
+      await idbPut("snapshots", currentChar);
+      await pushSnapshot(currentChar);
+      render(currentChar);
+      pushLog(`${field === "name" ? "Renamed to" : "Class set to"} ${newText}.`);
+    }
+
+    function cancel() {
+      setFlag(false);
+      element.classList.remove("editing");
+      element.contentEditable = "false";
+      element.textContent = field === "name" ? currentChar.name : currentChar.class;
+      render(currentChar);
+    }
+
+    element.addEventListener("click", () => begin());
+    element.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); commit(); }
+      if (e.key === "Escape") { e.preventDefault(); cancel(); }
+    });
+    element.addEventListener("blur", () => commit());
+    element.addEventListener("paste", e => {
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData("text");
+      document.execCommand("insertText", false, sanitize(text));
+    });
+  }
+
+  // Action loop
+  let runningAction = null;
+
+  async function startActionLoop() {
+    async function loop() {
+      // Complete quest
+      if (runningAction === "quest" && !quest.active) {
+        const outcome = await resolveQuestOutcome(currentChar);
+        const leveled = gainXP(currentChar, outcome.xp);
+        currentChar.needs.fatigue = clamp(currentChar.needs.fatigue + 0.2, 0, 1);
+        if (Array.isArray(outcome.loot)) for (const it of outcome.loot) currentChar.inventory.push({ ...it });
+        currentChar.updated_at = nowIso();
+
+        await idbPut("snapshots", currentChar);
+        await pushSnapshot(currentChar);
+        await recordEvent("quest_result", outcome);
+
+        pushLog(`Quest complete. +${outcome.xp}`);
+        if (outcome.loot && outcome.loot.length) pushLog(`Found ${outcome.loot.map(l=>l.name).join(", ")}.`);
+        if (leveled) pushLog(`Level up to ${currentChar.level}!`);
+        render(currentChar);
+        runningAction = null;
+      }
+
+      // Complete rest
+      if (runningAction === "rest" && !quest.active) {
+        currentChar.needs.fatigue = clamp(currentChar.needs.fatigue - 0.35, 0, 1);
+        currentChar.updated_at = nowIso();
+
+        await idbPut("snapshots", currentChar);
+        await pushSnapshot(currentChar);
+        await recordEvent("rest", {});
+
+        pushLog("Resting complete.");
+        render(currentChar);
+        runningAction = null;
+      }
+
+      // Start next action only if not editing
+      if (!runningAction && !userEditing) {
+        const action = decideAction(currentChar);
+        if (action === "quest") {
+          setQuestTitle(await getQuestTitle());
+          startQuest(6000);
+          runningAction = "quest";
+          pushLog("Setting out on a quest...");
+        } else {
+          setQuestTitle("Taking a breather");
+          startQuest(4000);
+          runningAction = "rest";
+          pushLog("Taking a rest...");
+        }
+      }
+
+      // Outbox flush
+      flushOutbox();
+
+      // Remote pull with edit-safe merge
+      if (server) {
+        const remote = await fetchJSON(`${server}/character/${charId}`);
+        if (remote) {
+          const local = (await idbGet("snapshots", charId)) || currentChar;
+          let chosen = local;
+          if (moreRecent(local, remote) === remote) chosen = mergeRemotePreservingEdits(local, remote);
+          currentChar = chosen;
+          await idbPut("snapshots", currentChar);
+          render(currentChar);
+        }
+      }
+
+      setTimeout(loop, 500);
+    }
+    loop();
+  }
+
+  // Start
+  (async function main(){
+    el.win.textContent = ""; // placeholder window
+    currentChar = await loadSnapshot();
+    render(currentChar);
+    pushLog("Widget ready.");
+
+    enableInlineEdit(el.name, "name", { maxLen: 32 });
+    enableInlineEdit(el.klass, "class", { maxLen: 20 });
+
+    startActionLoop();
+  })();
+  </script>
+</body>
+</html>

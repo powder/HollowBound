@@ -256,6 +256,74 @@
     return rows[rows.length - 1];
   };
 
+  function generateQuestLocally(gameData) {
+    const { locations, enemies, titles } = gameData;
+    if (!locations || locations.length === 0) return null;
+
+    const questTitle = titles && titles.length > 0 ? pick(titles).title : "A Grand Adventure";
+    const questId = `local_quest_${Date.now()}`;
+
+    const numNodes = Math.min(locations.length, 20 + Math.floor(Math.random() * 11));
+    const extraConnections = Math.floor(numNodes / 2);
+
+    const nodeTemplates = [...locations].sort(() => 0.5 - Math.random()).slice(0, numNodes);
+    const nodes = nodeTemplates.map((loc, i) => ({
+      id: `node_${i}`,
+      name: loc.name,
+      description: loc.description,
+      type: loc.type,
+      connections: [],
+      encounters: []
+    }));
+
+    const mainPath = [...nodes].sort(() => 0.5 - Math.random());
+    const startNodeId = mainPath[0].id;
+    const endNodeId = mainPath[mainPath.length - 1].id;
+
+    for (let i = 0; i < mainPath.length - 1; i++) {
+      const a = mainPath[i];
+      const b = mainPath[i+1];
+      a.connections.push(b.id);
+      b.connections.push(a.id);
+    }
+
+    for (let i = 0; i < extraConnections; i++) {
+      const a = pick(nodes);
+      const b = pick(nodes);
+      if (a.id === b.id || a.connections.includes(b.id)) continue;
+      a.connections.push(b.id);
+      b.connections.push(a.id);
+    }
+
+    nodes.forEach(node => {
+      if (Math.random() < 0.7 && enemies && enemies.length > 0) {
+        const enemy = pick(enemies);
+        node.encounters.push({
+          id: `enc_${Math.random().toString(36).slice(2, 8)}`,
+          description: `You are confronted by a ${enemy.name}!`,
+          enemy_id: enemy.id
+        });
+      } else {
+        node.encounters.push({
+          id: `enc_${Math.random().toString(36).slice(2, 8)}`,
+          description: "The area is quiet. You find a moment to rest.",
+          enemy_id: null
+        });
+      }
+    });
+
+    const nodesAsObject = nodes.reduce((acc, n) => { acc[n.id] = n; return acc; }, {});
+
+    return {
+      id: questId,
+      name: questTitle,
+      start_node_id: startNodeId,
+      end_node_id: endNodeId,
+      nodes: nodesAsObject,
+      travel_encounters: [] // Offline travel encounters not supported in this version
+    };
+  }
+
   const decideAction = (c, questState) => {
     // Simple AI:
     // 1. If there are unvisited connections, travel to one.
@@ -430,8 +498,20 @@
           pushLog("Server unreachable. Continuing quest in offline mode.");
           currentQuestState = cachedQuest.value;
         } else {
-          pushLog("Server unreachable and no active quest. Taking a short rest.");
-          setTimeout(loop, 10000); return;
+          pushLog("Server unreachable. Attempting to generate a new quest locally.");
+          const gameDataArr = await Promise.all([idbGet("game_data", "locations"), idbGet("game_data", "enemies"), idbGet("game_data", "titles")]);
+          const gameData = { locations: gameDataArr[0]?.value, enemies: gameDataArr[1]?.value, titles: gameDataArr[2]?.value };
+
+          const newQuest = generateQuestLocally(gameData);
+          if (newQuest) {
+            pushLog("Generated a new local quest: " + newQuest.name);
+            currentQuestState = newQuest;
+            await idbPut("current_quest", { id: charId, value: newQuest });
+          } else {
+            pushLog("Not enough local data to generate a quest. Resting instead.");
+            setTimeout(loop, 10000);
+            return;
+          }
         }
       }
       render(currentChar);

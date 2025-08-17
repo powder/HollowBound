@@ -633,7 +633,7 @@ post "/quests/complete" do
   character_id = body["character_id"]
   halt 400, { error: "character_id is required" }.to_json unless character_id
 
-  QUESTS.where(character_id: character_id).delete
+  ACTIVE_QUESTS.where(character_id: character_id).delete
   { ok: true }.to_json
 end
 

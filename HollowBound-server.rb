@@ -589,7 +589,7 @@ post "/quests/action" do
 
   when "explore"
     current_node = quest.get_node(current_node_id)
-    encounter = current_node.encounters.sample # Assuming one encounter per node for now
+    encounter = current_node.encounters.sample # Assuming one encounter per node
 
     if encounter && encounter.enemy_id
       # Resolve combat encounter

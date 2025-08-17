@@ -275,6 +275,16 @@ post "/quests/action" do
   outcome.to_json
 end
 
+# Clear a character's completed quest
+post "/quests/complete" do
+  body = json_body
+  character_id = body["character_id"]
+  halt 400, { error: "character_id is required" }.to_json unless character_id
+
+  QUESTS.where(character_id: character_id).delete
+  { ok: true }.to_json
+end
+
 # ---- Debug helpers ----
 
 get "/debug/characters" do

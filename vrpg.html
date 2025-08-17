@@ -217,6 +217,10 @@
     if (!server) return null;
     return await postJSON(`${server}/quests/action`, { character_id: charId, ...actionPayload });
   }
+  async function completeQuest() {
+    if (!server) return null;
+    return await postJSON(`${server}/quests/complete`, { character_id: charId });
+  }
 
   // Sim core
   const moreRecent = (a,b) => new Date(a.updated_at) > new Date(b.updated_at) ? a : b;
@@ -357,9 +361,9 @@
       // 2. Handle completed quest
       if (currentQuestState.completed) {
         pushLog(`Finished quest: ${currentQuestState.quest_name}! Taking a long rest.`);
-        // In a real implementation, we might delete the quest on the server
-        // so a new one generates on the next loop. For now, we just stop.
-        setTimeout(loop, 20000); // Wait a long time before next quest
+        await completeQuest();
+        currentQuestState = null; // Clear state to force refetch
+        setTimeout(loop, 15000); // Wait a long time before next quest
         return;
       }
 

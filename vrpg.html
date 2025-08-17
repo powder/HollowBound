@@ -116,6 +116,29 @@
     win: document.getElementById("charWindow")
   };
 
+  // Bootstrap Data
+  const bootstrapData = {
+    locations: [
+      { id: 1, name: "The Whispering Creek", description: "A quiet creek, but the trees seem to whisper secrets.", type: "forest" },
+      { id: 2, name: "Old Man's Hill", description: "A lonely hill dotted with ancient, weathered stones.", type: "hills" },
+      { id: 3, name: "Goblin Camp", description: "A crude, messy encampment of goblins.", type: "camp" },
+      { id: 4, name: "The Sunken Ruin", description: "The mossy stones of a forgotten building sink into the marsh.", type: "ruin" }
+    ],
+    enemies: [
+      { id: 1, name: "Goblin" },
+      { id: 2, name: "Giant Rat" }
+    ],
+    loot: [
+      { id: 1, key: "rusty_sword", name: "Rusty Sword", effects: { atk: 1 }, rarity: "common" },
+      { id: 2, key: "goblin_ear", name: "Goblin Ear", effects: {}, rarity: "common" },
+      { id: 3, key: "healing_draught", name: "Healing Draught", effects: { heal: 15 }, rarity: "uncommon" }
+    ],
+    titles: [
+      { id: 1, title: "The Goblin Menace" },
+      { id: 2, title: "A Rat in the Walls" }
+    ]
+  };
+
   // Params
   const params = new URLSearchParams(location.search);
   const server = params.get("server") || "localhost:4567";
@@ -213,17 +236,34 @@
   // New Quest API & Caching
   let lastSync = 0;
   async function syncAllData() {
-    if (!server || Date.now() - lastSync < 300000) return; // Sync at most every 5 mins
-    pushLog("Syncing game data with server...");
-    const [locations, enemies, loot] = await Promise.all([
-      fetchJSON(`${server}/api/locations`),
-      fetchJSON(`${server}/enemies`),
-      fetchJSON(`${server}/loot`)
+    if (Date.now() - lastSync < 300000 && server) return; // Sync at most every 5 mins
+
+    let locations, enemies, loot, titles;
+    if (server) {
+      pushLog("Syncing game data with server...");
+      [locations, enemies, loot, titles] = await Promise.all([
+        fetchJSON(`${server}/api/locations`),
+        fetchJSON(`${server}/enemies`),
+        fetchJSON(`${server}/loot`),
+        fetchJSON(`${server}/quests/titles`)
+      ]);
+    }
+
+    // Use bootstrap data as a fallback if server data is missing or empty
+    const finalLocations = (!locations || locations.length === 0) ? bootstrapData.locations : locations;
+    const finalEnemies = (!enemies || enemies.length === 0) ? bootstrapData.enemies : enemies;
+    const finalLoot = (!loot || loot.length === 0) ? bootstrapData.loot : loot;
+    const finalTitles = (!titles || titles.length === 0) ? bootstrapData.titles : titles;
+
+    await Promise.all([
+      idbPut("game_data", { key: "locations", value: finalLocations }),
+      idbPut("game_data", { key: "enemies", value: finalEnemies }),
+      idbPut("game_data", { key: "loot", value: finalLoot }),
+      idbPut("game_data", { key: "titles", value: finalTitles })
     ]);
-    if (locations) await idbPut("game_data", { key: "locations", value: locations });
-    if (enemies) await idbPut("game_data", { key: "enemies", value: enemies });
-    if (loot) await idbPut("game_data", { key: "loot", value: loot });
+
     lastSync = Date.now();
+    pushLog("Game data synced.");
   }
 
   async function getCurrentQuestState() {
@@ -587,6 +627,7 @@
   // Start
   (async function main(){
     el.win.textContent = ""; // placeholder window
+    await syncAllData(); // Prime the cache on startup
     currentChar = await loadSnapshot();
     render(currentChar);
     pushLog("Widget ready.");

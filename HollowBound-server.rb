@@ -514,6 +514,8 @@ get "/quests/current" do
 
   state = QuestManager.get_current_quest(character_id) || QuestManager.generate_new_quest(character_id)
 
+  halt 200, {}.to_json unless state
+
   quest = state[:quest]
   current_node = quest.get_node(state[:current_node_id])
 

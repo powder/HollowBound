@@ -117,41 +117,6 @@
     win: document.getElementById("charWindow")
   };
 
-  // Bootstrap Data
-  const bootstrapData = {
-    enemies: [ { id: 1, name: "Goblin" }, { id: 2, name: "Giant Rat" } ],
-    loot: [ { id: 1, key: "rusty_sword", name: "Rusty Sword", effects: { atk: 1 } } ],
-    titles: [ { id: 1, title: "A Menacing Threat" } ]
-  };
-
-  // Game Data Cache
-  let gameData = { ...bootstrapData };
-
-  async function syncData() {
-    // 1. Try to load from cache first
-    const cached = await idbGet("game_data", "content");
-    if (cached) {
-      gameData = cached.value;
-      pushLog("Loaded cached game data.");
-    }
-
-    // 2. Then, try to sync with server in the background
-    if (server) {
-      const [enemies, loot, titles] = await Promise.all([
-        fetchJSON(`${server}/enemies`),
-        fetchJSON(`${server}/loot`),
-        fetchJSON(`${server}/quests/titles`)
-      ]);
-
-      if (enemies && loot && titles && enemies.length > 0) {
-        const newData = { enemies, loot, titles };
-        gameData = newData;
-        await idbPut("game_data", { key: "content", value: newData });
-        pushLog("Synced game data with server.");
-      }
-    }
-  }
-
   // Params
   const params = new URLSearchParams(location.search);
   const server = params.get("server") || "localhost:4567";
@@ -159,12 +124,11 @@
 
   // IndexedDB
   const dbp = new Promise((resolve, reject) => {
-    const req = indexedDB.open("rpg_widget_db", 8); // Bump version for schema change
+    const req = indexedDB.open("rpg_widget_db", 7);
     req.onupgradeneeded = e => {
       const db = e.target.result;
       if (!db.objectStoreNames.contains("snapshots")) db.createObjectStore("snapshots", { keyPath: "id" });
       if (!db.objectStoreNames.contains("outbox")) db.createObjectStore("outbox", { keyPath: "id" });
-      if (!db.objectStoreNames.contains("game_data")) db.createObjectStore("game_data", { keyPath: "key" });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -383,7 +347,7 @@
     async function loop() {
       // Complete quest
       if (runningAction === "quest" && !quest.active) {
-        const outcome = await resolveQuestOutcome(currentChar, { enemy_id: quest.enemy_id });
+        const outcome = await resolveQuestOutcome(currentChar);
         const leveled = gainXP(currentChar, outcome.xp);
         currentChar.needs.fatigue = clamp(currentChar.needs.fatigue + 0.2, 0, 1);
         if (Array.isArray(outcome.loot)) for (const it of outcome.loot) currentChar.inventory.push({ ...it });
@@ -393,7 +357,7 @@
         await pushSnapshot(currentChar);
         await recordEvent("quest_result", outcome);
 
-        pushLog(`Quest complete. +${nfmt(outcome.xp)} XP.`);
+        pushLog(`Quest complete. +${outcome.xp}`);
         if (outcome.loot && outcome.loot.length) pushLog(`Found ${outcome.loot.map(l=>l.name).join(", ")}.`);
         if (leveled) pushLog(`Level up to ${currentChar.level}!`);
         render(currentChar);
@@ -418,16 +382,10 @@
       if (!runningAction && !userEditing) {
         const action = decideAction(currentChar);
         if (action === "quest") {
-          const targetEnemy = gameData.enemies.length > 0 ? pick(gameData.enemies) : null;
-          const baseTitleData = gameData.titles.length > 0 ? pick(gameData.titles) : { title: "A Quest" };
-
-          quest.enemy_id = targetEnemy ? targetEnemy.id : null;
-          const questTitle = targetEnemy ? `${baseTitleData.title}: Hunt the ${targetEnemy.name}` : baseTitleData.title;
-
-          setQuestTitle(questTitle);
-          startQuest(6000 + Math.random() * 4000); // 6-10s quests
+          setQuestTitle(await getQuestTitle());
+          startQuest(6000);
           runningAction = "quest";
-          pushLog(`Setting out to: ${questTitle}...`);
+          pushLog("Setting out on a quest...");
         } else {
           setQuestTitle("Taking a breather");
           startQuest(4000);
@@ -460,7 +418,6 @@
   // Start
   (async function main(){
     el.win.textContent = ""; // placeholder window
-    await syncData();
     currentChar = await loadSnapshot();
     render(currentChar);
     pushLog("Widget ready.");
